@@ -1,66 +1,82 @@
 const fs = require('fs');
-const csv = require('csv-parser');
-const client = require('./db');
+const pool = require('../db/create_db');
+const csvParser = require('csv-parser');
+const { on } = require('events');
 
-const filePath = 'Subject_matter.csv';
+// read csv file
+function readCSV(filePath, callback) {
+  const rows = [];
+  const features = new Set();
 
-const subjectItems = [
-  "APPLE_FRAME", "AURORA_BOREDEALIS", "BARN", "BEACH", "BRIDGE",
-  "BUILDING", "BUSHES", "CABIN", "CACTUS", "CIRCLE_FRAME", "CIRRUS", 
-  "CLIFF", "CLOUDS", "CONIFER", "CUMULUS", "DECIDUOUS", "DIANE_ANDRE", 
-  "DOCK", "DOUBLE_OVAL_FRAME", "FARM", "FENCE", "FIRE", "FLORIDA_FRAME", 
-  "FLOWERS", "FOG", "FRAMED", "GRASS", "GUEST", "HALF_CIRCLE_FRAME", 
-  "HALF_OVAL_FRAME", "HILLS", "LAKE", "LAKES", "LIGHTHOUSE", "MILL", 
-  "MOON", "MOUNTAIN", "MOUNTAINS", "NIGHT", "OCEAN", "OVAL_FRAME", 
-  "PALM_TREES", "PATH", "PERSON", "PORTRAIT", "RECTANGLE_3D_FRAME", 
-  "RECTANGULAR_FRAME", "RIVER", "ROCKS", "SEASHELL_FRAME", "SNOW", 
-  "SNOWY_MOUNTAIN", "SPLIT_FRAME", "STEVE_ROSS", "STRUCTURE", "SUN", 
-  "TOMB_FRAME", "TREE", "TREES", "TRIPLE_FRAME", "WATERFALL", "WAVES", 
-  "WINDMILL", "WINDOW_FRAME", "WINTER", "WOOD_FRAMED"
-];
+  fs.createReadStream(filePath) 
+    .pipe(csvParser()) // pipes the stream through the parser to convert each line into a javascript obj
+    .on('data', (row) => { // using built-in event 'data'
+      rows.push(row);
 
-let episodesSubjectData = [];
-
-fs.createReadStream(filePath)
-.pipe(csv())
-.on('data', (record) => {
-  const episodeIdentifier = record.EPISODE;
-
-  subjectItems.forEach(subjectName => {
-    if (parseInt(record[subjectName], 10) === 1) {
-      episodesSubjectData.push({
-        episode_id: episodeIdentifier,
-        subject_matter: subjectName
+      Object.keys(row).forEach((key) => {
+        if (key !== 'EPISODE' && key !== 'TITLE') {
+          features.add(key);
+        }
       });
-    }
-  });
-})
-.on('end', () => {
-  console.log('CSV file successfully processed');
-  saveSubjectsToDatabase();
-});
-
-
-async function saveSubjectsToDatabase() {
-  for (const episodeSubjectRecord of episodeSubjectData) {
-    try {
-      const result = await client.query(`
-        SELECT id FROM subjects WHERE subject_matter = $1
-      `, [episodeSubjectRecord.subject_matter]);
-
-      if (result.rows.length > 0) {
-        const subjectId = result.rows[0].id;
-
-        await client.query(`
-          INSERT INTO episodes_subjects (episode_id, subject_id)
-          VALUES ($1, $2)
-        `, [episodeSubjectRecord.episode_id, subjectId]);
-        console.log(`Inserted subject relation for episode: ${episodeSubjectRecord.episode_id}, subject: ${episodeSubjectRecord.subject_matter}`);
-      }
-    } catch (error) {
-      console.error('Error inserting episode-subject relation:', error.stack);
-    }
-  }
-
-  client.end();
+    })
+    .on('end', () => {
+      console.log('csv file successfully read');
+      callback(rows, features);
+    });
 }
+
+// Insert features into feature table
+function insertFeatures(features, callback) {
+  const query = 'INSERT INTO feature (feature) VALUES (?)';
+  let completed = 0;
+
+  features.forEach((feature) => {
+    // Executes the SQL query inserting the current feature int the feature table
+    pool.query(query, [feature], (error) => {
+      if(error) {
+        console.error('ERROR INSERTING FEATURE: ${feature}', error);
+        return;
+      }
+      console.log('FEATURE INSERTED INTO TABLE: ${feature}');
+
+      completed++;
+
+      if (completed === features.length) {
+        callback();
+      }
+    });
+  });
+}
+
+function processEpisodes(row, callback) {
+  const selectEpisodeQuery = 'SELECT episode_id FROM episode WHERE title = ?';
+  const insertEpisodeQuery = 'INSERT INTO episode (title, season, episode) VALUES (?, ?, ?)';
+  const selectFeatureQuery = 'SELECT feature_id FROM feature WHERE feature = ?';
+  const insertFeatureQuery = 'INSERT INTO episodeFeature (episode_id, feature_id, feature_exists) VALUES (?, ?, ?)';
+
+  let completed = 0;
+
+  rows.forEach((row) => {
+    // extract each season and column from EPISODE column
+    const regex = /S(\d+)E(\d+)/;
+    const match = row.EPISODE.match(regex);
+    const season = match ? parseInt(match[1], 10) : null;
+    const episodeNumber = match ? parseInt(match[2], 10) : null;
+
+    const title = row.TITLE.replace(/"/g, '').toUpperCase();
+
+    pool.query(selectEpisodeQuery, [title], (error, episodeResults) => {
+      if (error){
+        console.error('ERROR Finding EPISODE: ${title}', error);
+      }
+    })
+  })
+}
+
+// loop through the feature names ( Columns after title )
+
+// Add feature names to feature table if they dont already exist.
+
+// Map episodes to features
+
+//
