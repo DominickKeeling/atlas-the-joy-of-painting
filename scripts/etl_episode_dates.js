@@ -1,38 +1,34 @@
-const fs = require('fs');
-const pool = require('../db/create_db');
+const fs = require('fs/promises'); // Use promise-based fs module
+const { pool } = require('../db/create_db');
 
-let pendingQueries = 0;
-
-function readTextFile(filePath, callback) {
-  fs.readFile(filePath, 'utf8', (error, data) => {
-    if (error) {
-      console.error('ERROR READING FILE:', error);
-      return;
-    }
-
+async function readTextFile(filePath) {
+  try {
+    // Read file content
+    const data = await fs.readFile(filePath, 'utf8');
     const lines = data.split('\n');
-    lines.forEach((line) => {
+
+    // Process each line
+    for (const line of lines) {
       const regex = /"([^"]+)"\s*\(([^)]+)\)/; // matches title
-      const match = line.match(regex)
+      const match = line.match(regex);
 
       if (match) {
         const title = match[1];
         const dateAired = formatDate(match[2]); // create formatDate function
 
-        pendingQueries++;
-
-        insertEpisode(title, dateAired, () => {
-          pendingQueries--;
-          if (pendingQueries === 0 && callback) {
-            callback();
-          }
-        }); 
+        if (dateAired) {
+          // Insert episode into the database
+          await insertEpisode(title, dateAired);
+        } else {
+          console.warn(`EPISODE: "${title}" REJECTED.`);
+        }
       } else {
         console.warn(`Invalid line being skipped: ${line}`);
       }
-    });
-    if (lines.length === 0 && callback) callback();
-  });
+    }
+  } catch (error) {
+    console.error('ERROR READING FILE:', error);
+  }
 }
 
 function formatDate(dateString) {
@@ -48,7 +44,7 @@ function formatDate(dateString) {
     September: '09',
     October: '10',
     November: '11',
-    December: '12'
+    December: '12',
   };
 
   const regex = /([a-zA-Z]+) (\d{1,2}), (\d{4})/;
@@ -65,28 +61,20 @@ function formatDate(dateString) {
   return null;
 }
 
-// INSERTING EPISODE
-function insertEpisode(title, dateAired, callback) {
-  if (!dateAired) {
-    console.warn(`EPISODE: "${title}" REJECTED.`);
-    callback();
-    return;
+async function insertEpisode(title, dateAired) {
+  try {
+    const query = 'INSERT INTO episode (title, date_aired) VALUES (?, ?)';
+    const [results] = await pool.query(query, [title, dateAired]);
+    console.log(`Episode: "${title}" inserted with ID ${results.insertId}`);
+  } catch (error) {
+    console.error(`FAILED to insert episode: "${title}"`, error);
   }
-  
-  const query = 'INSERT INTO episode (title, date_aired) VALUES (?, ?)';
-  pool.query(query, [title, dateAired], (error, results) => {
-    if (error) {
-      console.error(`FAILED to insert episode:`, error);
-    } else {
-      console.log(`Episode: ${title} with ID ${results.insertId}`);
-    }
-    callback();
-  });
 }
 
-readTextFile('data/Episode_dates.text',() => {
-  console.log('All data processed and closing pool');
-  pool.end(() => {
-    console.log('Pool closed');
-  });
-});
+// Main function to read file and process data
+(async () => {
+  await readTextFile('data/Episode_dates.text');
+  console.log('All data processed. Closing pool...');
+  await pool.end(); // Close the connection pool
+  console.log('Pool closed');
+})();

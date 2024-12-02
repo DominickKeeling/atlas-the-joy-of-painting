@@ -1,82 +1,119 @@
 const fs = require('fs');
-const pool = require('../db/create_db');
+const fsPromises = require('fs/promises'); // Use the promise-based fs module
+const { pool } = require('../db/create_db');
 const csvParser = require('csv-parser');
-const { on } = require('events');
+const stream = require('stream');
+const { promisify } = require('util');
 
-// read csv file
-function readCSV(filePath, callback) {
+// Convert the stream-based CSV parser to a promise-based function
+const pipeline = promisify(stream.pipeline);
+
+async function readCSV(filePath) {
   const rows = [];
   const features = new Set();
 
-  fs.createReadStream(filePath) 
-    .pipe(csvParser()) // pipes the stream through the parser to convert each line into a javascript obj
-    .on('data', (row) => { // using built-in event 'data'
-      rows.push(row);
+  await pipeline(
+    fs.createReadStream(filePath),
+    csvParser(),
+    async function* (dataStream) {
+      for await (const row of dataStream) {
+        rows.push(row);
 
-      Object.keys(row).forEach((key) => {
-        if (key !== 'EPISODE' && key !== 'TITLE') {
-          features.add(key);
-        }
-      });
-    })
-    .on('end', () => {
-      console.log('csv file successfully read');
-      callback(rows, features);
-    });
+        Object.keys(row).forEach((key) => {
+          if (key !== 'EPISODE' && key !== 'TITLE') {
+            features.add(key);
+          }
+        });
+      }
+    }
+  );
+
+  console.log('CSV file successfully read');
+  return { rows, features };
 }
 
-// Insert features into feature table
-function insertFeatures(features, callback) {
+async function insertFeatures(features) {
   const query = 'INSERT INTO feature (feature) VALUES (?)';
-  let completed = 0;
+  const featureInsertPromises = Array.from(features).map((feature) =>
+    pool.query(query, [feature])
+      .then(() => console.log(`FEATURE INSERTED INTO TABLE: ${feature}`))
+      .catch((error) => console.error(`ERROR INSERTING FEATURE: ${feature}`, error))
+  );
 
-  features.forEach((feature) => {
-    // Executes the SQL query inserting the current feature int the feature table
-    pool.query(query, [feature], (error) => {
-      if(error) {
-        console.error('ERROR INSERTING FEATURE: ${feature}', error);
-        return;
-      }
-      console.log('FEATURE INSERTED INTO TABLE: ${feature}');
-
-      completed++;
-
-      if (completed === features.length) {
-        callback();
-      }
-    });
-  });
+  await Promise.all(featureInsertPromises);
 }
 
-function processEpisodes(row, callback) {
+async function processEpisodes(rows) {
   const selectEpisodeQuery = 'SELECT episode_id FROM episode WHERE title = ?';
   const insertEpisodeQuery = 'INSERT INTO episode (title, season, episode) VALUES (?, ?, ?)';
-  const selectFeatureQuery = 'SELECT feature_id FROM feature WHERE feature = ?';
-  const insertFeatureQuery = 'INSERT INTO episodeFeature (episode_id, feature_id, feature_exists) VALUES (?, ?, ?)';
+  const updateEpisodeQuery = 'UPDATE episode SET season = ?, episode = ? WHERE episode_id = ?';
 
-  let completed = 0;
-
-  rows.forEach((row) => {
-    // extract each season and column from EPISODE column
-    const regex = /S(\d+)E(\d+)/;
+  for (const row of rows) {
+    const regex = /S(\d+)E(\d+)/i;
     const match = row.EPISODE.match(regex);
     const season = match ? parseInt(match[1], 10) : null;
     const episodeNumber = match ? parseInt(match[2], 10) : null;
-
     const title = row.TITLE.replace(/"/g, '').toUpperCase();
 
-    pool.query(selectEpisodeQuery, [title], (error, episodeResults) => {
-      if (error){
-        console.error('ERROR Finding EPISODE: ${title}', error);
+    console.log(`Parsed Episode - Season: ${season}, Episode: ${episodeNumber}, Title: ${title}`);
+
+    try {
+      const [episodeResults] = await pool.query(selectEpisodeQuery, [title]);
+
+      let episodeId;
+      if (episodeResults.length === 0) {
+        const [results] = await pool.query(insertEpisodeQuery, [title, season, episodeNumber]);
+        console.log(`EPISODE INSERTED INTO TABLE: ${title}`);
+        episodeId = results.insertId;
+      } else {
+        episodeId = episodeResults[0].episode_id;
+        await pool.query(updateEpisodeQuery, [season, episodeNumber, episodeId]);
+        console.log(`EPISODE UPDATED IN TABLE: ${title}`);
       }
-    })
-  })
+
+      await mapFeaturesAndEpisode(row, episodeId);
+    } catch (error) {
+      console.error(`ERROR PROCESSING EPISODE: ${title}`, error);
+    }
+  }
 }
 
-// loop through the feature names ( Columns after title )
+async function mapFeaturesAndEpisode(row, episodeId) {
+  const searchFeatureQuery = 'SELECT feature_id FROM feature WHERE feature = ?';
+  const insertEpisodeFeatureQuery = 'INSERT INTO episodeFeature (episode_id, feature_id, feature_exists) VALUES (?, ?, ?)';
 
-// Add feature names to feature table if they dont already exist.
+  const featureMappingPromises = Object.keys(row)
+    .filter((feature) => row[feature] === '1')
+    .map(async (feature) => {
+      try {
+        const [featureResults] = await pool.query(searchFeatureQuery, [feature]);
+        if (featureResults.length === 0) {
+          throw new Error(`Feature not found: ${feature}`);
+        }
 
-// Map episodes to features
+        const featureId = featureResults[0].feature_id;
+        await pool.query(insertEpisodeFeatureQuery, [episodeId, featureId, true]);
+        console.log(`Mapped feature ${feature} to episode ${episodeId}`);
+      } catch (error) {
+        console.error(`ERROR MAPPING FEATURE: ${feature} to episode ${episodeId}`, error);
+      }
+    });
 
-//
+  await Promise.all(featureMappingPromises);
+}
+
+async function main() {
+  try {
+    const { rows, features } = await readCSV('data/Subject_matter.csv');
+    await insertFeatures(features);
+    await processEpisodes(rows);
+    console.log('Done processing episodes and features');
+  } catch (error) {
+    console.error('ERROR IN ETL PROCESS:', error);
+  } finally {
+    await pool.end(); // Ensure the connection pool is closed
+    console.log('Database connection closed');
+  }
+}
+
+main();
